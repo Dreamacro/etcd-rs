@@ -1,5 +1,6 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use arc_swap::{access::Access, ArcSwap, ArcSwapAny};
 use async_trait::async_trait;
 use tokio::sync::mpsc::channel;
 use tokio_stream::wrappers::ReceiverStream;
@@ -8,7 +9,7 @@ use tonic::{
     metadata::{Ascii, MetadataValue},
     service::Interceptor,
     transport::Channel,
-    Request, Status,
+    Code, Request, Status,
 };
 
 use crate::auth::{AuthOp, AuthenticateRequest, AuthenticateResponse};
@@ -36,13 +37,26 @@ use crate::{Error, Result};
 
 #[derive(Clone)]
 pub struct TokenInterceptor {
-    token: Option<MetadataValue<Ascii>>,
+    token: Option<Arc<ArcSwap<MetadataValue<Ascii>>>>,
 }
 
 impl TokenInterceptor {
     fn new(token: Option<String>) -> Self {
         Self {
-            token: token.map(|token: String| MetadataValue::try_from(&token).unwrap()),
+            token: token.map(|token: String| {
+                Arc::new(ArcSwap::from_pointee(
+                    MetadataValue::try_from(&token).unwrap(),
+                ))
+            }),
+        }
+    }
+
+    fn set_token(&self, token: Option<String>) {
+        match (&self.token, token) {
+            (Some(container), Some(token)) => {
+                container.store(Arc::new(MetadataValue::try_from(&token).unwrap()))
+            }
+            _ => {}
         }
     }
 }
@@ -51,6 +65,9 @@ impl Interceptor for TokenInterceptor {
     fn call(&mut self, mut req: tonic::Request<()>) -> std::result::Result<Request<()>, Status> {
         match &self.token {
             Some(token) => {
+                let token = <Arc<ArcSwapAny<Arc<MetadataValue<Ascii>>>> as Access<
+                    MetadataValue<Ascii>,
+                >>::load(token);
                 req.metadata_mut().insert("authorization", token.clone());
                 Ok(req)
             }
@@ -179,6 +196,8 @@ impl ClientConfig {
 /// Client is an abstraction for grouping etcd operations and managing underlying network communications.
 #[derive(Clone)]
 pub struct Client {
+    auth_interceptor: TokenInterceptor,
+    auth_info: Option<(String, String)>,
     auth_client: AuthClient<InterceptedService<Channel, TokenInterceptor>>,
     kv_client: KvClient<InterceptedService<Channel, TokenInterceptor>>,
     watch_client: WatchClient<InterceptedService<Channel, TokenInterceptor>>,
@@ -190,7 +209,11 @@ impl Client {
     /// Build clients from tonic [`Channel`] directly.
     ///
     /// For advanced users, it provides the ability to control more details about the connection.
-    pub fn with_channel(channel: Channel, token: Option<String>) -> Self {
+    pub fn with_channel(
+        channel: Channel,
+        auth_info: Option<(String, String)>,
+        token: Option<String>,
+    ) -> Self {
         let auth_interceptor = TokenInterceptor::new(token);
 
         let auth_client = AuthClient::with_interceptor(channel.clone(), auth_interceptor.clone());
@@ -198,9 +221,11 @@ impl Client {
         let watch_client = WatchClient::with_interceptor(channel.clone(), auth_interceptor.clone());
         let cluster_client =
             ClusterClient::with_interceptor(channel.clone(), auth_interceptor.clone());
-        let lease_client = LeaseClient::with_interceptor(channel, auth_interceptor);
+        let lease_client = LeaseClient::with_interceptor(channel, auth_interceptor.clone());
 
         Self {
+            auth_interceptor,
+            auth_info,
             auth_client,
             kv_client,
             watch_client,
@@ -209,7 +234,11 @@ impl Client {
         }
     }
 
-    pub async fn connect_with_token(cfg: &ClientConfig, token: Option<String>) -> Result<Self> {
+    pub async fn connect_with_token(
+        cfg: &ClientConfig,
+        auth_info: Option<(String, String)>,
+        token: Option<String>,
+    ) -> Result<Self> {
         let channel = {
             let mut endpoints = Vec::with_capacity(cfg.endpoints.len());
             for e in cfg.endpoints.iter() {
@@ -230,7 +259,7 @@ impl Client {
             Channel::balance_list(endpoints.into_iter())
         };
 
-        Ok(Self::with_channel(channel, token))
+        Ok(Self::with_channel(channel, auth_info, token))
     }
 
     /// Connects to etcd cluster and returns a client.
@@ -238,17 +267,45 @@ impl Client {
     /// # Errors
     /// Will returns `Err` if failed to contact with given endpoints or authentication failed.
     pub async fn connect(mut cfg: ClientConfig) -> Result<Self> {
-        let cli = Self::connect_with_token(&cfg, None).await?;
+        let cli = Self::connect_with_token(&cfg, None, None).await?;
 
         match cfg.auth.take() {
             Some((name, password)) => {
-                let token = cli.authenticate((name, password)).await?.token;
+                let token = cli
+                    .authenticate((name.clone(), password.clone()))
+                    .await?
+                    .token;
 
-                Self::connect_with_token(&cfg, Some(token)).await
+                Self::connect_with_token(&cfg, Some((name, password).into()), Some(token)).await
             }
             None => Ok(cli),
         }
     }
+
+    async fn refresh_token(&self) -> Result<()> {
+        let auth = match &self.auth_info {
+            Some(auth) => auth.clone(),
+            None => return Ok(()),
+        };
+        let resp = self.authenticate(auth).await?;
+        self.auth_interceptor.set_token(Some(resp.token));
+
+        Ok(())
+    }
+}
+
+macro_rules! check_refresh_token {
+    ($self:ident, $e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(err) => {
+                if err.code() == Code::Unauthenticated {
+                    $self.refresh_token().await?;
+                }
+                return Err(err.into());
+            }
+        }
+    };
 }
 
 #[async_trait]
@@ -271,7 +328,7 @@ impl KeyValueOp for Client {
         R: Into<PutRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.kv_client.clone().put(req).await?;
+        let resp = check_refresh_token!(self, self.kv_client.clone().put(req).await);
 
         Ok(resp.into_inner().into())
     }
@@ -281,7 +338,7 @@ impl KeyValueOp for Client {
         R: Into<RangeRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.kv_client.clone().range(req).await?;
+        let resp = check_refresh_token!(self, self.kv_client.clone().range(req).await);
 
         Ok(resp.into_inner().into())
     }
@@ -310,7 +367,7 @@ impl KeyValueOp for Client {
         R: Into<DeleteRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.kv_client.clone().delete_range(req).await?;
+        let resp = check_refresh_token!(self, self.kv_client.clone().delete_range(req).await);
 
         Ok(resp.into_inner().into())
     }
@@ -339,7 +396,7 @@ impl KeyValueOp for Client {
         R: Into<TxnRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.kv_client.clone().txn(req).await?;
+        let resp = check_refresh_token!(self, self.kv_client.clone().txn(req).await);
 
         Ok(resp.into_inner().into())
     }
@@ -349,7 +406,7 @@ impl KeyValueOp for Client {
         R: Into<CompactRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.kv_client.clone().compact(req).await?;
+        let resp = check_refresh_token!(self, self.kv_client.clone().compact(req).await);
 
         Ok(resp.into_inner().into())
     }
@@ -370,7 +427,7 @@ impl WatchOp for Client {
         req.metadata_mut()
             .insert("hasleader", "true".try_into().unwrap());
 
-        let resp = self.watch_client.clone().watch(req).await?;
+        let resp = check_refresh_token!(self, self.watch_client.clone().watch(req).await);
 
         let mut inbound = resp.into_inner();
 
@@ -399,7 +456,7 @@ impl LeaseOp for Client {
         R: Into<LeaseGrantRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.lease_client.clone().lease_grant(req).await?;
+        let resp = check_refresh_token!(self, self.lease_client.clone().lease_grant(req).await);
         Ok(resp.into_inner().into())
     }
 
@@ -408,7 +465,7 @@ impl LeaseOp for Client {
         R: Into<LeaseRevokeRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.lease_client.clone().lease_revoke(req).await?;
+        let resp = check_refresh_token!(self, self.lease_client.clone().lease_revoke(req).await);
         Ok(resp.into_inner().into())
     }
 
@@ -424,12 +481,11 @@ impl LeaseOp for Client {
             .await
             .map_err(|_| Error::ChannelClosed)?;
 
-        let mut resp_rx = self
-            .lease_client
-            .clone()
-            .lease_keep_alive(req_rx)
-            .await?
-            .into_inner();
+        let resp = check_refresh_token!(
+            self,
+            self.lease_client.clone().lease_keep_alive(req_rx).await
+        );
+        let mut resp_rx = resp.into_inner();
 
         let lease_id = match resp_rx.message().await? {
             Some(resp) => resp.id,
@@ -446,7 +502,10 @@ impl LeaseOp for Client {
         R: Into<LeaseTimeToLiveRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.lease_client.clone().lease_time_to_live(req).await?;
+        let resp = check_refresh_token!(
+            self,
+            self.lease_client.clone().lease_time_to_live(req).await
+        );
         Ok(resp.into_inner().into())
     }
 }
@@ -458,7 +517,7 @@ impl ClusterOp for Client {
         R: Into<MemberAddRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.cluster_client.clone().member_add(req).await?;
+        let resp = check_refresh_token!(self, self.cluster_client.clone().member_add(req).await);
 
         Ok(resp.into_inner().into())
     }
@@ -468,7 +527,7 @@ impl ClusterOp for Client {
         R: Into<MemberRemoveRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.cluster_client.clone().member_remove(req).await?;
+        let resp = check_refresh_token!(self, self.cluster_client.clone().member_remove(req).await);
 
         Ok(resp.into_inner().into())
     }
@@ -478,14 +537,14 @@ impl ClusterOp for Client {
         R: Into<MemberUpdateRequest> + Send,
     {
         let req = tonic::Request::new(req.into().into());
-        let resp = self.cluster_client.clone().member_update(req).await?;
+        let resp = check_refresh_token!(self, self.cluster_client.clone().member_update(req).await);
 
         Ok(resp.into_inner().into())
     }
 
     async fn member_list(&self) -> Result<MemberListResponse> {
         let req = tonic::Request::new(MemberListRequest::new().into());
-        let resp = self.cluster_client.clone().member_list(req).await?;
+        let resp = check_refresh_token!(self, self.cluster_client.clone().member_list(req).await);
 
         Ok(resp.into_inner().into())
     }
